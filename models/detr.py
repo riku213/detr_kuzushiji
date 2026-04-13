@@ -20,7 +20,9 @@ from .transformer import build_transformer
 
 class DETR(nn.Module):
     """ This is the DETR module that performs object detection """
-    def __init__(self, backbone, transformer, num_classes, num_queries, aux_loss=False):
+    def __init__(self, backbone, transformer, num_classes, num_queries, aux_loss=False,
+                 use_text_queries=False, text_vocab_size=65536, text_pad_token_id=0,
+                 text_max_len=512, text_encoder_layers=1, bbox_only=False):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -34,14 +36,30 @@ class DETR(nn.Module):
         self.num_queries = num_queries
         self.transformer = transformer
         hidden_dim = transformer.d_model
-        self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
+        self.bbox_only = bbox_only
+        self.use_text_queries = use_text_queries
+        self.text_pad_token_id = text_pad_token_id
+        if not self.bbox_only:
+            self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
-        self.query_embed = nn.Embedding(num_queries, hidden_dim)
+        if self.use_text_queries:
+            self.query_embed = None
+            self.text_query_encoder = TextQueryEncoder(
+                vocab_size=text_vocab_size,
+                d_model=hidden_dim,
+                max_len=text_max_len,
+                n_layers=text_encoder_layers,
+                n_heads=transformer.nhead,
+                pad_id=text_pad_token_id,
+            )
+        else:
+            self.query_embed = nn.Embedding(num_queries, hidden_dim)
+            self.text_query_encoder = None
         self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)
         self.backbone = backbone
         self.aux_loss = aux_loss
 
-    def forward(self, samples: NestedTensor):
+    def forward(self, samples: NestedTensor, text_inputs=None):
         """ The forward expects a NestedTensor, which consists of:
                - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
                - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
@@ -62,13 +80,30 @@ class DETR(nn.Module):
 
         src, mask = features[-1].decompose()
         assert mask is not None
-        hs = self.transformer(self.input_proj(src), mask, self.query_embed.weight, pos[-1])[0]
+        query_padding_mask = None
+        if self.use_text_queries:
+            if text_inputs is None:
+                raise ValueError("text_inputs is required when use_text_queries=True")
+            query_embed, query_padding_mask = self.text_query_encoder(text_inputs)
+            hs = self.transformer(
+                self.input_proj(src), mask, query_embed, pos[-1],
+                query_padding_mask=query_padding_mask,
+            )[0]
+        else:
+            hs = self.transformer(self.input_proj(src), mask, self.query_embed.weight, pos[-1])[0]
 
-        outputs_class = self.class_embed(hs)
         outputs_coord = self.bbox_embed(hs).sigmoid()
-        out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
+        out = {'pred_boxes': outputs_coord[-1]}
+        if not self.bbox_only:
+            outputs_class = self.class_embed(hs)
+            out['pred_logits'] = outputs_class[-1]
         if self.aux_loss:
-            out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
+            if self.bbox_only:
+                out['aux_outputs'] = self._set_aux_loss_bbox_only(outputs_coord)
+            else:
+                out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
+        if query_padding_mask is not None:
+            out['query_padding_mask'] = query_padding_mask
         return out
 
     @torch.jit.unused
@@ -78,6 +113,107 @@ class DETR(nn.Module):
         # as a dict having both a Tensor and a list.
         return [{'pred_logits': a, 'pred_boxes': b}
                 for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
+
+    @torch.jit.unused
+    def _set_aux_loss_bbox_only(self, outputs_coord):
+        return [{'pred_boxes': b} for b in outputs_coord[:-1]]
+
+
+class TextQueryEncoder(nn.Module):
+    def __init__(self, vocab_size, d_model, max_len, n_layers, n_heads, pad_id):
+        super().__init__()
+        self.pad_id = pad_id
+        self.token_embed = nn.Embedding(vocab_size, d_model, padding_idx=pad_id)
+        self.pos_embed = nn.Embedding(max_len, d_model)
+        layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=4 * d_model,
+            dropout=0.1,
+            batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers)
+
+    def forward(self, token_ids_list):
+        if not isinstance(token_ids_list, (list, tuple)):
+            raise ValueError("text_inputs must be a list of token-id tensors")
+        if len(token_ids_list) == 0:
+            raise ValueError("text_inputs must not be empty")
+
+        device = token_ids_list[0].device
+        max_len = min(max(int(t.shape[0]) for t in token_ids_list), self.pos_embed.num_embeddings)
+        batch_size = len(token_ids_list)
+
+        token_ids = torch.full(
+            (batch_size, max_len), self.pad_id,
+            dtype=torch.long,
+            device=device,
+        )
+        valid_mask = torch.zeros((batch_size, max_len), dtype=torch.bool, device=device)
+        for i, ids in enumerate(token_ids_list):
+            n = min(int(ids.shape[0]), max_len)
+            token_ids[i, :n] = ids[:n]
+            valid_mask[i, :n] = True
+
+        pos = torch.arange(max_len, device=device, dtype=torch.long).unsqueeze(0).expand(batch_size, max_len)
+        x = self.token_embed(token_ids) + self.pos_embed(pos)
+        x = self.encoder(x, src_key_padding_mask=~valid_mask)
+        return x, ~valid_mask
+
+
+class SetCriterionAligned(nn.Module):
+    """BBox-only criterion with aligned supervision (no Hungarian matching)."""
+
+    def __init__(self, weight_dict):
+        super().__init__()
+        self.weight_dict = weight_dict
+
+    def _loss_boxes_aligned(self, pred_boxes, targets):
+        target_boxes = []
+        valid_masks = []
+        max_q = pred_boxes.shape[1]
+        device = pred_boxes.device
+
+        for t in targets:
+            tb = t['boxes_aligned']
+            n = min(int(tb.shape[0]), max_q)
+            padded = torch.zeros((max_q, 4), dtype=pred_boxes.dtype, device=device)
+            mask = torch.zeros((max_q,), dtype=torch.bool, device=device)
+            if n > 0:
+                padded[:n] = tb[:n].to(device=device, dtype=pred_boxes.dtype)
+                mask[:n] = True
+            target_boxes.append(padded)
+            valid_masks.append(mask)
+
+        target_boxes = torch.stack(target_boxes, dim=0)
+        valid_masks = torch.stack(valid_masks, dim=0)
+
+        if valid_masks.any():
+            diff = F.l1_loss(pred_boxes, target_boxes, reduction='none').sum(-1)
+            loss_bbox = diff[valid_masks].mean()
+
+            src_boxes = pred_boxes[valid_masks]
+            tgt_boxes = target_boxes[valid_masks]
+            loss_giou = 1 - torch.diag(box_ops.generalized_box_iou(
+                box_ops.box_cxcywh_to_xyxy(src_boxes),
+                box_ops.box_cxcywh_to_xyxy(tgt_boxes)
+            ))
+            loss_giou = loss_giou.mean()
+        else:
+            zero = pred_boxes.sum() * 0.0
+            loss_bbox = zero
+            loss_giou = zero
+
+        return {'loss_bbox': loss_bbox, 'loss_giou': loss_giou, 'class_error': pred_boxes.sum() * 0.0}
+
+    def forward(self, outputs, targets):
+        losses = self._loss_boxes_aligned(outputs['pred_boxes'], targets)
+        if 'aux_outputs' in outputs:
+            for i, aux_outputs in enumerate(outputs['aux_outputs']):
+                l_dict = self._loss_boxes_aligned(aux_outputs['pred_boxes'], targets)
+                l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
+                losses.update(l_dict)
+        return losses
 
 
 class SetCriterion(nn.Module):
@@ -321,12 +457,21 @@ def build(args):
 
     transformer = build_transformer(args)
 
+    use_text_queries = getattr(args, 'use_text_queries', False)
+    bbox_only = getattr(args, 'bbox_only', False)
+
     model = DETR(
         backbone,
         transformer,
         num_classes=num_classes,
         num_queries=args.num_queries,
         aux_loss=args.aux_loss,
+        use_text_queries=use_text_queries,
+        text_vocab_size=getattr(args, 'text_vocab_size', 65536),
+        text_pad_token_id=getattr(args, 'text_pad_token_id', 0),
+        text_max_len=getattr(args, 'text_max_len', 512),
+        text_encoder_layers=getattr(args, 'text_encoder_layers', 1),
+        bbox_only=bbox_only,
     )
     if args.masks:
         model = DETRsegm(model, freeze_detr=(args.frozen_weights is not None))
@@ -343,13 +488,22 @@ def build(args):
             aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items()})
         weight_dict.update(aux_weight_dict)
 
-    losses = ['labels', 'boxes', 'cardinality']
-    if args.masks:
-        losses += ["masks"]
-    criterion = SetCriterion(num_classes, matcher=matcher, weight_dict=weight_dict,
-                             eos_coef=args.eos_coef, losses=losses)
+    if bbox_only:
+        weight_dict = {'loss_bbox': args.bbox_loss_coef, 'loss_giou': args.giou_loss_coef}
+        if args.aux_loss:
+            aux_weight_dict = {}
+            for i in range(args.dec_layers - 1):
+                aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items()})
+            weight_dict.update(aux_weight_dict)
+        criterion = SetCriterionAligned(weight_dict=weight_dict)
+    else:
+        losses = ['labels', 'boxes', 'cardinality']
+        if args.masks:
+            losses += ["masks"]
+        criterion = SetCriterion(num_classes, matcher=matcher, weight_dict=weight_dict,
+                                 eos_coef=args.eos_coef, losses=losses)
     criterion.to(device)
-    postprocessors = {'bbox': PostProcess()}
+    postprocessors = {'bbox': PostProcess()} if not bbox_only else {}
     if args.masks:
         postprocessors['segm'] = PostProcessSegm()
         if args.dataset_file == "coco_panoptic":

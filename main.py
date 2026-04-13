@@ -55,6 +55,18 @@ def get_args_parser():
     parser.add_argument('--num_queries', default=100, type=int,
                         help="Number of query slots")
     parser.add_argument('--pre_norm', action='store_true')
+    parser.add_argument('--use_text_queries', action='store_true',
+                        help='Use text encoder output as decoder queries')
+    parser.add_argument('--bbox_only', action='store_true',
+                        help='Train bbox-only model without classification head')
+    parser.add_argument('--text_vocab_size', default=65536, type=int,
+                        help='Vocabulary size for text query encoder')
+    parser.add_argument('--text_pad_token_id', default=0, type=int,
+                        help='Padding token id for text query encoder')
+    parser.add_argument('--text_max_len', default=512, type=int,
+                        help='Max token length for positional embeddings')
+    parser.add_argument('--text_encoder_layers', default=1, type=int,
+                        help='Number of transformer layers for text query encoder')
 
     # * Segmentation
     parser.add_argument('--masks', action='store_true',
@@ -82,6 +94,14 @@ def get_args_parser():
     parser.add_argument('--dataset_file', default='coco')
     parser.add_argument('--coco_path', type=str)
     parser.add_argument('--coco_panoptic_path', type=str)
+    parser.add_argument('--kuzushiji_path', type=str,
+                        help='Path to kuzushiji char-level CSV dataset root')
+    parser.add_argument('--kuzushiji_split_ratio', default=0.8, type=float,
+                        help='Train split ratio for kuzushiji_text dataset')
+    parser.add_argument('--kuzushiji_max_samples', default=None, type=int,
+                        help='Limit samples for debugging')
+    parser.add_argument('--kuzushiji_sort_tokens', action='store_true',
+                        help='Sort tokens by reading order (-x, y)')
     parser.add_argument('--remove_difficult', action='store_true')
 
     parser.add_argument('--output_dir', default='',
@@ -105,6 +125,10 @@ def get_args_parser():
 def main(args):
     utils.init_distributed_mode(args)
     print("git:\n  {}\n".format(utils.get_sha()))
+
+    if args.dataset_file == "kuzushiji_text":
+        args.use_text_queries = True
+        args.bbox_only = True
 
     if args.frozen_weights is not None:
         assert args.masks, "Frozen training is meant for segmentation only"
@@ -161,6 +185,8 @@ def main(args):
         # We also evaluate AP during panoptic training, on original coco DS
         coco_val = datasets.coco.build("val", args)
         base_ds = get_coco_api_from_dataset(coco_val)
+    elif args.dataset_file == "kuzushiji_text":
+        base_ds = None
     else:
         base_ds = get_coco_api_from_dataset(dataset_val)
 
@@ -184,7 +210,7 @@ def main(args):
     if args.eval:
         test_stats, coco_evaluator = evaluate(model, criterion, postprocessors,
                                               data_loader_val, base_ds, device, args.output_dir)
-        if args.output_dir:
+        if args.output_dir and coco_evaluator is not None:
             utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, output_dir / "eval.pth")
         return
 

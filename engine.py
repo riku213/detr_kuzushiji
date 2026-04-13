@@ -28,8 +28,14 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
         samples = samples.to(device)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+        text_inputs = None
+        if len(targets) > 0 and 'token_ids' in targets[0]:
+            text_inputs = [t['token_ids'] for t in targets]
 
-        outputs = model(samples)
+        if text_inputs is None:
+            outputs = model(samples)
+        else:
+            outputs = model(samples, text_inputs=text_inputs)
         loss_dict = criterion(outputs, targets)
         weight_dict = criterion.weight_dict
         losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
@@ -56,7 +62,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         optimizer.step()
 
         metric_logger.update(loss=loss_value, **loss_dict_reduced_scaled, **loss_dict_reduced_unscaled)
-        metric_logger.update(class_error=loss_dict_reduced['class_error'])
+        if 'class_error' in loss_dict_reduced:
+            metric_logger.update(class_error=loss_dict_reduced['class_error'])
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
@@ -74,7 +81,7 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
     header = 'Test:'
 
     iou_types = tuple(k for k in ('segm', 'bbox') if k in postprocessors.keys())
-    coco_evaluator = CocoEvaluator(base_ds, iou_types)
+    coco_evaluator = CocoEvaluator(base_ds, iou_types) if len(iou_types) > 0 and base_ds is not None else None
     # coco_evaluator.coco_eval[iou_types[0]].params.iouThrs = [0, 0.1, 0.5, 0.75]
 
     panoptic_evaluator = None
@@ -88,8 +95,14 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
     for samples, targets in metric_logger.log_every(data_loader, 10, header):
         samples = samples.to(device)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+        text_inputs = None
+        if len(targets) > 0 and 'token_ids' in targets[0]:
+            text_inputs = [t['token_ids'] for t in targets]
 
-        outputs = model(samples)
+        if text_inputs is None:
+            outputs = model(samples)
+        else:
+            outputs = model(samples, text_inputs=text_inputs)
         loss_dict = criterion(outputs, targets)
         weight_dict = criterion.weight_dict
 
@@ -102,18 +115,22 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
         metric_logger.update(loss=sum(loss_dict_reduced_scaled.values()),
                              **loss_dict_reduced_scaled,
                              **loss_dict_reduced_unscaled)
-        metric_logger.update(class_error=loss_dict_reduced['class_error'])
+        if 'class_error' in loss_dict_reduced:
+            metric_logger.update(class_error=loss_dict_reduced['class_error'])
 
-        orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
-        results = postprocessors['bbox'](outputs, orig_target_sizes)
-        if 'segm' in postprocessors.keys():
-            target_sizes = torch.stack([t["size"] for t in targets], dim=0)
-            results = postprocessors['segm'](results, outputs, orig_target_sizes, target_sizes)
-        res = {target['image_id'].item(): output for target, output in zip(targets, results)}
-        if coco_evaluator is not None:
-            coco_evaluator.update(res)
+        if 'bbox' in postprocessors.keys():
+            orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
+            results = postprocessors['bbox'](outputs, orig_target_sizes)
+            if 'segm' in postprocessors.keys():
+                target_sizes = torch.stack([t["size"] for t in targets], dim=0)
+                results = postprocessors['segm'](results, outputs, orig_target_sizes, target_sizes)
+            res = {target['image_id'].item(): output for target, output in zip(targets, results)}
+            if coco_evaluator is not None:
+                coco_evaluator.update(res)
 
         if panoptic_evaluator is not None:
+            target_sizes = torch.stack([t["size"] for t in targets], dim=0)
+            orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
             res_pano = postprocessors["panoptic"](outputs, target_sizes, orig_target_sizes)
             for i, target in enumerate(targets):
                 image_id = target["image_id"].item()

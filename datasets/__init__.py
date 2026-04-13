@@ -3,6 +3,7 @@ import torch.utils.data
 import torchvision
 
 from .coco import build as build_coco
+from .kuzushiji_text import build as build_kuzushiji_text
 
 
 def get_coco_api_from_dataset(dataset):
@@ -22,4 +23,6 @@ def build_dataset(image_set, args):
         # to avoid making panopticapi required for coco
         from .coco_panoptic import build as build_coco_panoptic
         return build_coco_panoptic(image_set, args)
+    if args.dataset_file == 'kuzushiji_text':
+        return build_kuzushiji_text(image_set, args)
     raise ValueError(f'dataset {args.dataset_file} not supported')
