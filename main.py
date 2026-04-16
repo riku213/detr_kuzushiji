@@ -102,6 +102,10 @@ def get_args_parser():
                         help='Limit samples for debugging')
     parser.add_argument('--kuzushiji_sort_tokens', action='store_true',
                         help='Sort tokens by reading order (-x, y)')
+    parser.add_argument('--kuzushiji_resize_short', default=640, type=int,
+                        help='Resize short side for kuzushiji_text images')
+    parser.add_argument('--kuzushiji_resize_max_size', default=1024, type=int,
+                        help='Resize max size for kuzushiji_text images')
     parser.add_argument('--remove_difficult', action='store_true')
 
     parser.add_argument('--output_dir', default='',

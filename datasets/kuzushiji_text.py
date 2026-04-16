@@ -8,9 +8,30 @@ from PIL import Image
 import datasets.transforms as T
 
 
+def make_kuzushiji_transforms(image_set, resize_short=640, max_size=1024):
+    normalize = T.Compose([
+        T.ToTensor(),
+        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
+
+    if image_set == "train":
+        return T.Compose([
+            T.RandomResize([resize_short], max_size=max_size),
+            normalize,
+        ])
+
+    if image_set == "val":
+        return T.Compose([
+            T.RandomResize([resize_short], max_size=max_size),
+            normalize,
+        ])
+
+    raise ValueError(f"unknown split {image_set}")
+
+
 class KuzushijiTextDataset(torch.utils.data.Dataset):
     def __init__(self, root, split="train", split_ratio=0.8, seed=42, max_samples=None,
-                 vocab_size=65536, sort_tokens=False):
+                 vocab_size=65536, sort_tokens=False, resize_short=640, resize_max_size=1024):
         self.root = Path(root)
         if not self.root.exists():
             raise ValueError(f"provided dataset path {self.root} does not exist")
@@ -35,11 +56,11 @@ class KuzushijiTextDataset(torch.utils.data.Dataset):
         if max_samples is not None:
             self.samples = self.samples[:max_samples]
 
-        normalize = T.Compose([
-            T.ToTensor(),
-            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-        ])
-        self._transforms = normalize
+        self._transforms = make_kuzushiji_transforms(
+            split,
+            resize_short=resize_short,
+            max_size=resize_max_size,
+        )
 
     def _codepoint_to_char(self, codepoint):
         if isinstance(codepoint, str) and codepoint.startswith("U+"):
@@ -172,7 +193,7 @@ class KuzushijiTextDataset(torch.utils.data.Dataset):
         }
 
         if self._transforms is not None:
-            image, _ = self._transforms(image, None)
+            image, target = self._transforms(image, target)
 
         return image, target
 
@@ -190,4 +211,6 @@ def build(image_set, args):
         max_samples=getattr(args, "kuzushiji_max_samples", None),
         vocab_size=getattr(args, "text_vocab_size", 65536),
         sort_tokens=getattr(args, "kuzushiji_sort_tokens", False),
+        resize_short=getattr(args, "kuzushiji_resize_short", 640),
+        resize_max_size=getattr(args, "kuzushiji_resize_max_size", 1024),
     )
