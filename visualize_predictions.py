@@ -174,6 +174,11 @@ def main():
                 valid_n = int(target["token_ids"].shape[0])
                 pred_boxes = pred_boxes[:valid_n]
 
+            print('-'*30)
+            print(f"Sample {idx}: predicted: {pred_boxes.shape[0]} valid_n: {valid_n}")            
+            if pred_boxes.numel() > 0:
+                print("pred cxcywh mean:", pred_boxes.mean(dim=0).tolist())
+                print("pred cxcywh std :", pred_boxes.std(dim=0).tolist())
             if "boxes_aligned" in target:
                 gt_boxes = target["boxes_aligned"].cpu()
             elif "boxes" in target:

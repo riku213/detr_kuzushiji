@@ -168,6 +168,24 @@ class SetCriterionAligned(nn.Module):
         super().__init__()
         self.weight_dict = weight_dict
 
+    def _loss_query_dup(self, pred_boxes, valid_masks):
+        # Penalize high IoU between different query boxes in the same sample.
+        pair_iou_means = []
+        for b in range(pred_boxes.shape[0]):
+            boxes_b = pred_boxes[b][valid_masks[b]]
+            if boxes_b.shape[0] <= 1:
+                continue
+            boxes_xyxy = box_ops.box_cxcywh_to_xyxy(boxes_b)
+            iou_mat, _ = box_ops.box_iou(boxes_xyxy, boxes_xyxy)
+            tri = torch.triu_indices(iou_mat.shape[0], iou_mat.shape[1], offset=1, device=iou_mat.device)
+            if tri.shape[1] == 0:
+                continue
+            pair_iou_means.append(iou_mat[tri[0], tri[1]].mean())
+
+        if len(pair_iou_means) == 0:
+            return pred_boxes.sum() * 0.0
+        return torch.stack(pair_iou_means).mean()
+
     def _loss_boxes_aligned(self, pred_boxes, targets):
         target_boxes = []
         valid_masks = []
@@ -199,12 +217,19 @@ class SetCriterionAligned(nn.Module):
                 box_ops.box_cxcywh_to_xyxy(tgt_boxes)
             ))
             loss_giou = loss_giou.mean()
+            loss_query_dup = self._loss_query_dup(pred_boxes, valid_masks)
         else:
             zero = pred_boxes.sum() * 0.0
             loss_bbox = zero
             loss_giou = zero
+            loss_query_dup = zero
 
-        return {'loss_bbox': loss_bbox, 'loss_giou': loss_giou, 'class_error': pred_boxes.sum() * 0.0}
+        return {
+            'loss_bbox': loss_bbox,
+            'loss_giou': loss_giou,
+            'loss_query_dup': loss_query_dup,
+            'class_error': pred_boxes.sum() * 0.0,
+        }
 
     def forward(self, outputs, targets):
         losses = self._loss_boxes_aligned(outputs['pred_boxes'], targets)
@@ -489,7 +514,11 @@ def build(args):
         weight_dict.update(aux_weight_dict)
 
     if bbox_only:
-        weight_dict = {'loss_bbox': args.bbox_loss_coef, 'loss_giou': args.giou_loss_coef}
+        weight_dict = {
+            'loss_bbox': args.bbox_loss_coef,
+            'loss_giou': args.giou_loss_coef,
+            'loss_query_dup': args.query_dup_coef,
+        }
         if args.aux_loss:
             aux_weight_dict = {}
             for i in range(args.dec_layers - 1):
