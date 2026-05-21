@@ -89,6 +89,8 @@ def get_args_parser():
     parser.add_argument('--giou_loss_coef', default=2, type=float)
     parser.add_argument('--query_dup_coef', default=0.2, type=float,
                         help='Penalty coefficient for overlapping query predictions in bbox-only mode')
+    parser.add_argument('--text_interp_coef', default=1.0, type=float,
+                        help='Text interpretation guidance loss coefficient')
     parser.add_argument('--eos_coef', default=0.1, type=float,
                         help="Relative classification weight of the no-object class")
 
@@ -108,6 +110,10 @@ def get_args_parser():
                         help='Resize short side for kuzushiji_text images')
     parser.add_argument('--kuzushiji_resize_max_size', default=1024, type=int,
                         help='Resize max size for kuzushiji_text images')
+    parser.add_argument('--kuzushiji_use_crop_grid', default=True, type=bool,
+                        help='Enable cropping to 4x4 grid for kuzushiji_text dataset')
+    parser.add_argument('--kuzushiji_grid_size', default=4, type=int,
+                        help='Number of grid divisions for kuzushiji_text cropping')
     parser.add_argument('--remove_difficult', action='store_true')
 
     parser.add_argument('--output_dir', default='',

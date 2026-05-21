@@ -5,6 +5,7 @@ DETR model and criterion classes.
 import torch
 import torch.nn.functional as F
 from torch import nn
+import warnings
 
 from util import box_ops
 from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
@@ -39,6 +40,7 @@ class DETR(nn.Module):
         self.bbox_only = bbox_only
         self.use_text_queries = use_text_queries
         self.text_pad_token_id = text_pad_token_id
+        self.text_vocab_size = text_vocab_size
         if not self.bbox_only:
             self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
@@ -52,9 +54,15 @@ class DETR(nn.Module):
                 n_heads=transformer.nhead,
                 pad_id=text_pad_token_id,
             )
+            # Text interpretation guidance head for encoder refinement
+            self.text_interp_head = TextInterpretationHead(
+                hidden_dim=hidden_dim,
+                text_vocab_size=text_vocab_size,
+            )
         else:
             self.query_embed = nn.Embedding(num_queries, hidden_dim)
             self.text_query_encoder = None
+            self.text_interp_head = None
         self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)
         self.backbone = backbone
         self.aux_loss = aux_loss
@@ -81,6 +89,8 @@ class DETR(nn.Module):
         src, mask = features[-1].decompose()
         assert mask is not None
         query_padding_mask = None
+        pred_text_logits = None
+        
         if self.use_text_queries:
             if text_inputs is None:
                 raise ValueError("text_inputs is required when use_text_queries=True")
@@ -89,11 +99,24 @@ class DETR(nn.Module):
                 self.input_proj(src), mask, query_embed, pos[-1],
                 query_padding_mask=query_padding_mask,
             )[0]
+            
+            # Store query_padding_mask for later use (can be used in criterion)
         else:
             hs = self.transformer(self.input_proj(src), mask, self.query_embed.weight, pos[-1])[0]
+            query_padding_mask = None
 
         outputs_coord = self.bbox_embed(hs).sigmoid()
         out = {'pred_boxes': outputs_coord[-1]}
+        
+        # For text interpretation guidance, compute logits from final decoder layer
+        # Note: In bbox_only mode with text_queries, we can extract text logits from decoder output
+        if self.use_text_queries and hasattr(self, 'text_interp_head'):
+            # hs shape from transformer: [L, B, Q, d_model]
+            # Get the final layer output [B, Q, d_model]
+            final_hs = hs[-1]
+            pred_text_logits = self.text_interp_head.get_text_logits(final_hs)
+            out['pred_text_logits'] = pred_text_logits
+            
         if not self.bbox_only:
             outputs_class = self.class_embed(hs)
             out['pred_logits'] = outputs_class[-1]
@@ -231,8 +254,75 @@ class SetCriterionAligned(nn.Module):
             'class_error': pred_boxes.sum() * 0.0,
         }
 
+    def _loss_text_interp(self, pred_text_logits, targets):
+        """Compute cross-entropy loss for text interpretation guidance.
+        
+        Args:
+            pred_text_logits: [B, Q, vocab_size] text classification logits from final decoder layer
+            targets: list of target dicts containing 'token_ids'
+        
+        Returns:
+            dict with 'loss_text_interp'
+        """
+        if pred_text_logits is None:
+            return {'loss_text_interp': torch.tensor(0.0)}
+
+        if len(targets) == 0 or 'token_ids' not in targets[0]:
+            # No text targets available for this batch
+            zero_loss = pred_text_logits.sum() * 0.0
+            return {'loss_text_interp': zero_loss}
+
+        batch_size = pred_text_logits.shape[0]
+        device = pred_text_logits.device
+        num_queries = pred_text_logits.shape[1]
+        vocab_size = pred_text_logits.shape[2]
+
+        # Prepare target token ids with padding
+        target_ids = torch.full((batch_size, num_queries), 0, dtype=torch.long, device=device)
+        valid_mask = torch.zeros((batch_size, num_queries), dtype=torch.bool, device=device)
+
+        # If number of targets and model batch size mismatch, warn and truncate
+        if len(targets) != batch_size:
+            warnings.warn(
+                f"_loss_text_interp: pred batch size={batch_size} != len(targets)={len(targets)}. "
+                "Truncating to the minimum of the two.")
+
+        use_batch = min(len(targets), batch_size)
+        for b in range(use_batch):
+            target = targets[b]
+            token_ids = target['token_ids']
+            if isinstance(token_ids, torch.Tensor):
+                token_ids = token_ids.to(device=device)
+            else:
+                token_ids = torch.tensor(token_ids, dtype=torch.long, device=device)
+
+            n = min(len(token_ids), num_queries)
+            if n > 0:
+                target_ids[b, :n] = token_ids[:n]
+                valid_mask[b, :n] = True
+        
+        # Compute cross-entropy loss only on valid positions
+        if not valid_mask.any():
+            return {'loss_text_interp': torch.tensor(0.0, device=device)}
+        
+        # Reshape for cross-entropy: [B*Q, vocab_size] and [B*Q]
+        logits_flat = pred_text_logits.reshape(-1, vocab_size)
+        targets_flat = target_ids.reshape(-1)
+        mask_flat = valid_mask.reshape(-1)
+        
+        # Compute cross-entropy only on valid positions
+        loss_text_interp = F.cross_entropy(logits_flat[mask_flat], targets_flat[mask_flat], reduction='mean')
+        
+        return {'loss_text_interp': loss_text_interp}
+
     def forward(self, outputs, targets):
         losses = self._loss_boxes_aligned(outputs['pred_boxes'], targets)
+        
+        # Add text interpretation loss if available
+        if 'pred_text_logits' in outputs:
+            text_losses = self._loss_text_interp(outputs['pred_text_logits'], targets)
+            losses.update(text_losses)
+        
         if 'aux_outputs' in outputs:
             for i, aux_outputs in enumerate(outputs['aux_outputs']):
                 l_dict = self._loss_boxes_aligned(aux_outputs['pred_boxes'], targets)
@@ -447,6 +537,37 @@ class PostProcess(nn.Module):
         return results
 
 
+class TextInterpretationHead(nn.Module):
+    """Text interpretation guidance head for decoder output refinement.
+    
+    This head projects decoder output to text vocabulary logits, guiding the model
+    to learn representations aligned with character identity.
+    Shape: [B, Q, d_model] -> text classification logits [B, Q, vocab_size]
+    """
+
+    def __init__(self, hidden_dim, text_vocab_size):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.text_vocab_size = text_vocab_size
+        
+        # Lightweight projection to vocabulary: LayerNorm -> Linear(hidden_dim -> vocab_size)
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.fc_vocab = nn.Linear(hidden_dim, text_vocab_size)
+    
+    def get_text_logits(self, decoder_output):
+        """Extract text classification logits from decoder output.
+        
+        Args:
+            decoder_output: [B, Q, hidden_dim] decoder output
+        
+        Returns:
+            text_logits: [B, Q, vocab_size] text classification logits
+        """
+        normed = self.norm(decoder_output)
+        vocab_logits = self.fc_vocab(normed)
+        return vocab_logits
+
+
 class MLP(nn.Module):
     """ Very simple multi-layer perceptron (also called FFN)"""
 
@@ -518,6 +639,7 @@ def build(args):
             'loss_bbox': args.bbox_loss_coef,
             'loss_giou': args.giou_loss_coef,
             'loss_query_dup': args.query_dup_coef,
+            'loss_text_interp': getattr(args, 'text_interp_coef', 1.0),
         }
         if args.aux_loss:
             aux_weight_dict = {}

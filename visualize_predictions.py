@@ -29,6 +29,8 @@ def parse_args():
     parser.add_argument("--kuzushiji_path", type=str, default=None)
     parser.add_argument("--kuzushiji_resize_short", type=int, default=None)
     parser.add_argument("--kuzushiji_resize_max_size", type=int, default=None)
+    parser.add_argument("--kuzushiji_use_crop_grid", type=bool, default=None)
+    parser.add_argument("--kuzushiji_grid_size", type=int, default=None)
     return parser.parse_args()
 
 
@@ -70,6 +72,8 @@ def ensure_checkpoint_args(train_args, cli_args):
         "kuzushiji_sort_tokens": False,
         "kuzushiji_resize_short": 640,
         "kuzushiji_resize_max_size": 1024,
+        "kuzushiji_use_crop_grid": True,
+        "kuzushiji_grid_size": 4,
     }
 
     for k, v in defaults.items():
@@ -86,6 +90,10 @@ def ensure_checkpoint_args(train_args, cli_args):
         train_args.kuzushiji_resize_short = cli_args.kuzushiji_resize_short
     if cli_args.kuzushiji_resize_max_size is not None:
         train_args.kuzushiji_resize_max_size = cli_args.kuzushiji_resize_max_size
+    if cli_args.kuzushiji_use_crop_grid is not None:
+        train_args.kuzushiji_use_crop_grid = cli_args.kuzushiji_use_crop_grid
+    if cli_args.kuzushiji_grid_size is not None:
+        train_args.kuzushiji_grid_size = cli_args.kuzushiji_grid_size
 
     if train_args.dataset_file == "kuzushiji_text":
         train_args.use_text_queries = True
