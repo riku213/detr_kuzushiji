@@ -91,6 +91,8 @@ def get_args_parser():
                         help='Penalty coefficient for overlapping query predictions in bbox-only mode')
     parser.add_argument('--text_interp_coef', default=1.0, type=float,
                         help='Text interpretation guidance loss coefficient')
+    parser.add_argument('--enc_text_coef', default=1.0, type=float,
+                        help='Encoder text guidance loss coefficient')
     parser.add_argument('--eos_coef', default=0.1, type=float,
                         help="Relative classification weight of the no-object class")
 

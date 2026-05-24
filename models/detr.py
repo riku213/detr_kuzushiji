@@ -41,6 +41,12 @@ class DETR(nn.Module):
         self.use_text_queries = use_text_queries
         self.text_pad_token_id = text_pad_token_id
         self.text_vocab_size = text_vocab_size
+        self.encoder_text_head = None
+        if self.use_text_queries:
+            self.encoder_text_head = EncoderTextGuidanceHead(
+                in_channels=backbone.num_channels,
+                text_vocab_size=text_vocab_size,
+            )
         if not self.bbox_only:
             self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
@@ -90,6 +96,10 @@ class DETR(nn.Module):
         assert mask is not None
         query_padding_mask = None
         pred_text_logits = None
+        enc_logits = None
+
+        if self.use_text_queries and self.encoder_text_head is not None:
+            enc_logits, src = self.encoder_text_head(src)
         
         if self.use_text_queries:
             if text_inputs is None:
@@ -107,6 +117,9 @@ class DETR(nn.Module):
 
         outputs_coord = self.bbox_embed(hs).sigmoid()
         out = {'pred_boxes': outputs_coord[-1]}
+        if enc_logits is not None:
+            out['enc_logits'] = enc_logits
+            out['enc_mask'] = mask
         
         # For text interpretation guidance, compute logits from final decoder layer
         # Note: In bbox_only mode with text_queries, we can extract text logits from decoder output
@@ -315,6 +328,65 @@ class SetCriterionAligned(nn.Module):
         
         return {'loss_text_interp': loss_text_interp}
 
+    def _build_enc_labels(self, enc_logits, targets):
+        batch_size, _, height, width = enc_logits.shape
+        device = enc_logits.device
+        labels = torch.zeros((batch_size, height, width), dtype=torch.long, device=device)
+
+        for b, target in enumerate(targets):
+            if 'boxes_aligned' not in target or 'token_ids' not in target:
+                continue
+            boxes = target['boxes_aligned']
+            token_ids = target['token_ids']
+            if isinstance(boxes, torch.Tensor):
+                boxes = boxes.to(device=device)
+            else:
+                boxes = torch.tensor(boxes, dtype=torch.float32, device=device)
+            if isinstance(token_ids, torch.Tensor):
+                token_ids = token_ids.to(device=device)
+            else:
+                token_ids = torch.tensor(token_ids, dtype=torch.long, device=device)
+
+            if boxes.numel() == 0 or token_ids.numel() == 0:
+                continue
+
+            n = min(int(boxes.shape[0]), int(token_ids.shape[0]))
+            boxes = boxes[:n]
+            token_ids = token_ids[:n]
+
+            cx, cy, bw, bh = boxes.unbind(-1)
+            x1 = ((cx - 0.5 * bw) * width).floor().clamp(0, width - 1).to(torch.int64)
+            x2 = ((cx + 0.5 * bw) * width).ceil().clamp(0, width - 1).to(torch.int64)
+            y1 = ((cy - 0.5 * bh) * height).floor().clamp(0, height - 1).to(torch.int64)
+            y2 = ((cy + 0.5 * bh) * height).ceil().clamp(0, height - 1).to(torch.int64)
+
+            for i in range(n):
+                if x2[i] < x1[i] or y2[i] < y1[i]:
+                    continue
+                labels[b, y1[i]:y2[i] + 1, x1[i]:x2[i] + 1] = token_ids[i]
+
+        return labels
+
+    def _loss_enc_text(self, enc_logits, enc_mask, targets):
+        if enc_logits is None:
+            return {'loss_enc_text': torch.tensor(0.0)}
+
+        labels = self._build_enc_labels(enc_logits, targets)
+        vocab_size = enc_logits.shape[1]
+        logits_flat = enc_logits.permute(0, 2, 3, 1).reshape(-1, vocab_size)
+        targets_flat = labels.reshape(-1)
+
+        if enc_mask is not None:
+            valid = ~enc_mask.reshape(-1)
+            logits_flat = logits_flat[valid]
+            targets_flat = targets_flat[valid]
+
+        if logits_flat.numel() == 0:
+            return {'loss_enc_text': enc_logits.sum() * 0.0}
+
+        loss_enc_text = F.cross_entropy(logits_flat, targets_flat, reduction='mean')
+        return {'loss_enc_text': loss_enc_text}
+
     def forward(self, outputs, targets):
         losses = self._loss_boxes_aligned(outputs['pred_boxes'], targets)
         
@@ -322,6 +394,10 @@ class SetCriterionAligned(nn.Module):
         if 'pred_text_logits' in outputs:
             text_losses = self._loss_text_interp(outputs['pred_text_logits'], targets)
             losses.update(text_losses)
+
+        if 'enc_logits' in outputs:
+            enc_losses = self._loss_enc_text(outputs['enc_logits'], outputs.get('enc_mask'), targets)
+            losses.update(enc_losses)
         
         if 'aux_outputs' in outputs:
             for i, aux_outputs in enumerate(outputs['aux_outputs']):
@@ -537,6 +613,20 @@ class PostProcess(nn.Module):
         return results
 
 
+class EncoderTextGuidanceHead(nn.Module):
+    """Project encoder features to vocab logits and back to features for correction."""
+
+    def __init__(self, in_channels, text_vocab_size):
+        super().__init__()
+        self.to_vocab = nn.Conv2d(in_channels, text_vocab_size, kernel_size=1)
+        self.to_features = nn.Conv2d(text_vocab_size, in_channels, kernel_size=1)
+
+    def forward(self, x):
+        vocab_logits = self.to_vocab(x)
+        corrected = x + self.to_features(vocab_logits)
+        return vocab_logits, corrected
+
+
 class TextInterpretationHead(nn.Module):
     """Text interpretation guidance head for decoder output refinement.
     
@@ -646,6 +736,7 @@ def build(args):
             for i in range(args.dec_layers - 1):
                 aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items()})
             weight_dict.update(aux_weight_dict)
+        weight_dict['loss_enc_text'] = getattr(args, 'enc_text_coef', 1.0)
         criterion = SetCriterionAligned(weight_dict=weight_dict)
     else:
         losses = ['labels', 'boxes', 'cardinality']
