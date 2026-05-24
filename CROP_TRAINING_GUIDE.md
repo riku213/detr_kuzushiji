@@ -16,14 +16,7 @@
 ### 1. デフォルト設定（クロップあり、4×4グリッド）
 
 ```bash
-python main.py \
-  --dataset_file kuzushiji_text \
-  --kuzushiji_path <path_to_dataset> \
-  --epochs 300 \
-  --batch_size 4 \
-  --num_workers 4 \
-  --output_dir outputs/detr_kuzushiji_crop \
-  --device cuda
+python main.py --dataset_file kuzushiji_text --kuzushiji_path ../kuzushiji_recognition/char_sep_datas --epochs 300 --batch_size 10 --num_workers 4 --output_dir outputs/detr_kuzushiji_crop --device cuda
 ```
 
 **説明:**
@@ -131,6 +124,18 @@ python main.py \
 **説明:**
 - `--eval`: 評価モードのみ実行（学習なし）
 - `--resume`: チェックポイント指定
+
+---
+
+### 7. エンコーダ矯正あり（text-query + 4×4クロップ）
+
+```bash
+python main.py --dataset_file kuzushiji_text --kuzushiji_path ../kuzushiji-recognition/char_sep_datas  --kuzushiji_use_crop_grid True --kuzushiji_grid_size 4 --enc_text_coef 1.0  --text_interp_coef 1.0 --epochs 300 --batch_size 10  --num_workers 4 --output_dir outputs/detr_kuzushiji_crop_enc_guided  --device cuda
+```
+
+**説明:**
+- エンコーダ出力に対する矯正ロス（`--enc_text_coef`）を追加
+- text-query とクロップ学習は従来通り
 
 ---
 
