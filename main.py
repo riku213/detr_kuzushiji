@@ -143,6 +143,9 @@ def main(args):
     if args.dataset_file == "kuzushiji_text":
         args.use_text_queries = True
         args.bbox_only = True
+    elif args.dataset_file == "kuzushiji_det":
+        args.use_text_queries = False
+        args.bbox_only = False
 
     if args.frozen_weights is not None:
         assert args.masks, "Frozen training is meant for segmentation only"
@@ -155,6 +158,14 @@ def main(args):
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
+
+    dataset_train = build_dataset(image_set='train', args=args)
+    dataset_val = build_dataset(image_set='val', args=args)
+
+    if hasattr(dataset_train, "num_classes"):
+        args.num_classes = int(dataset_train.num_classes)
+        if args.dataset_file == "kuzushiji_det":
+            args.text_vocab_size = int(dataset_train.num_classes)
 
     model, criterion, postprocessors = build_model(args)
     model.to(device)
@@ -177,9 +188,6 @@ def main(args):
                                   weight_decay=args.weight_decay)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop)
 
-    dataset_train = build_dataset(image_set='train', args=args)
-    dataset_val = build_dataset(image_set='val', args=args)
-
     if args.distributed:
         sampler_train = DistributedSampler(dataset_train)
         sampler_val = DistributedSampler(dataset_val, shuffle=False)
@@ -199,7 +207,7 @@ def main(args):
         # We also evaluate AP during panoptic training, on original coco DS
         coco_val = datasets.coco.build("val", args)
         base_ds = get_coco_api_from_dataset(coco_val)
-    elif args.dataset_file == "kuzushiji_text":
+    elif args.dataset_file in ("kuzushiji_text", "kuzushiji_det"):
         base_ds = None
     else:
         base_ds = get_coco_api_from_dataset(dataset_val)

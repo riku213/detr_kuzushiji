@@ -147,7 +147,7 @@ def transform_bbox_to_crop_coords(x, y, w, h, crop_box, crop_w, crop_h):
 class KuzushijiTextDataset(torch.utils.data.Dataset):
     def __init__(self, root, split="train", split_ratio=0.8, seed=42, max_samples=None,
                  vocab_size=65536, sort_tokens=False, resize_short=640, resize_max_size=1024,
-                 use_crop_grid=True, grid_size=4):
+                 use_crop_grid=True, grid_size=4, allow_empty=False):
         self.root = Path(root)
         if not self.root.exists():
             raise ValueError(f"provided dataset path {self.root} does not exist")
@@ -155,9 +155,14 @@ class KuzushijiTextDataset(torch.utils.data.Dataset):
         self.vocab_size = int(vocab_size)
         self.pad_token_id = 0
         self.unk_token_id = 1
+        self.unk_label_id = 0
+        self.char_to_label = {}
+        self.label_to_char = {}
+        self.num_classes = 1
         self.sort_tokens = sort_tokens
         self.use_crop_grid = use_crop_grid
         self.grid_size = grid_size
+        self.allow_empty = allow_empty
 
         samples = self._build_samples()
         g = torch.Generator().manual_seed(seed)
@@ -209,6 +214,8 @@ class KuzushijiTextDataset(torch.utils.data.Dataset):
     def _build_samples(self):
         image_index = self._build_image_index()
         rows_by_image = {}
+        char_order = []
+        seen_chars = set()
 
         for doc_folder in os.listdir(self.root):
             doc_path = self.root / doc_folder
@@ -240,6 +247,9 @@ class KuzushijiTextDataset(torch.utils.data.Dataset):
                             continue
 
                         ch = self._codepoint_to_char(row[0])
+                        if ch not in seen_chars:
+                            seen_chars.add(ch)
+                            char_order.append(ch)
                         rows_by_image.setdefault(image_id, {
                             "image_path": image_path,
                             "items": [],
@@ -252,6 +262,10 @@ class KuzushijiTextDataset(torch.utils.data.Dataset):
                             "h": h,
                         })
 
+        self.char_to_label = {ch: idx + 1 for idx, ch in enumerate(char_order)}
+        self.label_to_char = {idx: ch for ch, idx in self.char_to_label.items()}
+        self.num_classes = len(self.char_to_label) + 1
+
         samples = []
         for image_id, data in rows_by_image.items():
             items = data["items"]
@@ -259,6 +273,7 @@ class KuzushijiTextDataset(torch.utils.data.Dataset):
                 items.sort(key=lambda r: (-r["x"], r["y"]))
 
             tokens = [self._char_to_token_id(it["char"]) for it in items]
+            labels = [self.char_to_label.get(it["char"], self.unk_label_id) for it in items]
             boxes_xywh = [[it["x"], it["y"], it["w"], it["h"]] for it in items]
             if len(tokens) == 0:
                 continue
@@ -267,6 +282,7 @@ class KuzushijiTextDataset(torch.utils.data.Dataset):
                 "image_id": image_id,
                 "image_path": data["image_path"],
                 "token_ids": tokens,
+                "label_ids": labels,
                 "boxes_xywh": boxes_xywh,
             })
         return samples
@@ -293,8 +309,12 @@ class KuzushijiTextDataset(torch.utils.data.Dataset):
         width, height = image.size
 
         tokens = []
+        labels = []
         boxes = []
-        for token_id, (x, y, w, h) in zip(sample["token_ids"], sample["boxes_xywh"]):
+        boxes_xyxy = []
+        for token_id, label_id, (x, y, w, h) in zip(
+            sample["token_ids"], sample["label_ids"], sample["boxes_xywh"]
+        ):
             x = max(0.0, min(float(x), width - 1.0))
             y = max(0.0, min(float(y), height - 1.0))
             x2 = max(0.0, min(x + float(w), width))
@@ -310,15 +330,28 @@ class KuzushijiTextDataset(torch.utils.data.Dataset):
             nh = hh / height
             boxes.append([cx, cy, nw, nh])
             tokens.append(token_id)
+            labels.append(label_id)
+            boxes_xyxy.append([x, y, x2, y2])
 
-        if len(tokens) == 0:
+        if len(tokens) == 0 and not self.allow_empty:
             tokens = [self.unk_token_id]
+            labels = [self.unk_label_id]
             boxes = [[0.5, 0.5, 1e-6, 1e-6]]
+            boxes_xyxy = [[0.0, 0.0, 1e-6, 1e-6]]
+
+        boxes_aligned = torch.tensor(boxes, dtype=torch.float32)
+        boxes_xyxy_t = torch.tensor(boxes_xyxy, dtype=torch.float32)
+        if boxes_aligned.numel() == 0:
+            boxes_aligned = torch.zeros((0, 4), dtype=torch.float32)
+        if boxes_xyxy_t.numel() == 0:
+            boxes_xyxy_t = torch.zeros((0, 4), dtype=torch.float32)
 
         target = {
             "image_id": torch.tensor([idx]),
-            "boxes_aligned": torch.tensor(boxes, dtype=torch.float32),
+            "boxes_aligned": boxes_aligned,
             "token_ids": torch.tensor(tokens, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long),
+            "boxes": boxes_xyxy_t,
             "orig_size": torch.tensor([int(height), int(width)]),
             "size": torch.tensor([int(height), int(width)]),
         }
@@ -349,7 +382,8 @@ class KuzushijiTextDataset(torch.utils.data.Dataset):
         for i, (x, y, w, h) in enumerate(sample["boxes_xywh"]):
             items.append({
                 "idx": i,
-                "char": sample["token_ids"][i],  # Store token_id directly
+                "token_id": sample["token_ids"][i],
+                "label_id": sample["label_ids"][i],
                 "x": x,
                 "y": y,
                 "w": w,
@@ -360,15 +394,22 @@ class KuzushijiTextDataset(torch.utils.data.Dataset):
 
         # Transform bboxes to crop coordinates and normalize
         tokens = []
+        labels = []
         boxes = []
+        boxes_xyxy = []
         for orig_idx, item in chars_in_crop:
-            token_id = item["char"]
+            token_id = item["token_id"]
+            label_id = item["label_id"]
             x, y, w, h = item["x"], item["y"], item["w"], item["h"]
 
             # Transform bbox to crop coordinates
             cx_norm, cy_norm, w_norm, h_norm = transform_bbox_to_crop_coords(
                 x, y, w, h, crop_box, crop_w, crop_h
             )
+            x1_local = max(x, x1_crop) - x1_crop
+            y1_local = max(y, y1_crop) - y1_crop
+            x2_local = min(x + w, x2_crop) - x1_crop
+            y2_local = min(y + h, y2_crop) - y1_crop
 
             # Skip if bbox has no visible area
             if w_norm <= 0.0 or h_norm <= 0.0:
@@ -376,18 +417,30 @@ class KuzushijiTextDataset(torch.utils.data.Dataset):
 
             boxes.append([cx_norm, cy_norm, w_norm, h_norm])
             tokens.append(token_id)
+            labels.append(label_id)
+            boxes_xyxy.append([x1_local, y1_local, x2_local, y2_local])
 
         # Handle empty crop
-        if len(tokens) == 0:
+        if len(tokens) == 0 and not self.allow_empty:
             tokens = [self.unk_token_id]
+            labels = [self.unk_label_id]
             boxes = [[0.5, 0.5, 1e-6, 1e-6]]
+            boxes_xyxy = [[0.0, 0.0, 1e-6, 1e-6]]
 
         # Make image_id unique per crop to avoid overwriting results during evaluation
         unique_image_id = sample_idx * (self.grid_size * self.grid_size) + crop_idx
+        boxes_aligned = torch.tensor(boxes, dtype=torch.float32)
+        boxes_xyxy_t = torch.tensor(boxes_xyxy, dtype=torch.float32)
+        if boxes_aligned.numel() == 0:
+            boxes_aligned = torch.zeros((0, 4), dtype=torch.float32)
+        if boxes_xyxy_t.numel() == 0:
+            boxes_xyxy_t = torch.zeros((0, 4), dtype=torch.float32)
         target = {
             "image_id": torch.tensor([unique_image_id]),
-            "boxes_aligned": torch.tensor(boxes, dtype=torch.float32),
+            "boxes_aligned": boxes_aligned,
             "token_ids": torch.tensor(tokens, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long),
+            "boxes": boxes_xyxy_t,
             "orig_size": torch.tensor([int(crop_h), int(crop_w)]),
             "size": torch.tensor([int(crop_h), int(crop_w)]),
         }
@@ -415,4 +468,5 @@ def build(image_set, args):
         resize_max_size=getattr(args, "kuzushiji_resize_max_size", 1024),
         use_crop_grid=getattr(args, "kuzushiji_use_crop_grid", True),
         grid_size=getattr(args, "kuzushiji_grid_size", 4),
+        allow_empty=not getattr(args, "use_text_queries", False),
     )
