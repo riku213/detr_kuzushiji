@@ -29,9 +29,22 @@ def parse_args():
     parser.add_argument("--kuzushiji_path", type=str, default=None)
     parser.add_argument("--kuzushiji_resize_short", type=int, default=None)
     parser.add_argument("--kuzushiji_resize_max_size", type=int, default=None)
-    parser.add_argument("--kuzushiji_use_crop_grid", type=bool, default=None)
+    parser.add_argument("--kuzushiji_use_crop_grid", type=parse_bool, default=None)
     parser.add_argument("--kuzushiji_grid_size", type=int, default=None)
     return parser.parse_args()
+
+
+def parse_bool(value):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
 
 
 def ensure_checkpoint_args(train_args, cli_args):
