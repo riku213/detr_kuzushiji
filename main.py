@@ -110,7 +110,7 @@ def get_args_parser():
                         help='Resize short side for kuzushiji_text images')
     parser.add_argument('--kuzushiji_resize_max_size', default=1024, type=int,
                         help='Resize max size for kuzushiji_text images')
-    parser.add_argument('--kuzushiji_use_crop_grid', default=True, type=bool,
+    parser.add_argument('--kuzushiji_use_crop_grid', default=True, type=parse_bool,
                         help='Enable cropping to 4x4 grid for kuzushiji_text dataset')
     parser.add_argument('--kuzushiji_grid_size', default=4, type=int,
                         help='Number of grid divisions for kuzushiji_text cropping')
@@ -132,6 +132,19 @@ def get_args_parser():
                         help='number of distributed processes')
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
     return parser
+
+
+def parse_bool(value):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
 
 
 def main(args):
