@@ -53,6 +53,47 @@ python main.py \
 
 ---
 
+### 2.1 元のDETR（分類あり）で学習
+
+```bash
+python main.py \
+  --dataset_file kuzushiji_det \
+  --kuzushiji_path <path_to_dataset> \
+  --kuzushiji_use_crop_grid False \
+  --epochs 300 \
+  --batch_size 4 \
+  --num_workers 4 \
+  --output_dir outputs/detr_kuzushiji_det_no_crop \
+  --device cuda
+```
+
+**説明:**
+- テキストクエリを使わず、分類 + bbox 回帰の標準DETR
+- `kuzushiji_det` は文字クラスを `labels` として学習
+
+---
+
+### 2.2 元のDETR（分類あり）で4×4クロップ学習
+
+```bash
+python main.py \
+  --dataset_file kuzushiji_det \
+  --kuzushiji_path <path_to_dataset> \
+  --kuzushiji_use_crop_grid True \
+  --kuzushiji_grid_size 4 \
+  --epochs 300 \
+  --batch_size 4 \
+  --num_workers 4 \
+  --output_dir outputs/detr_kuzushiji_det_crop \
+  --device cuda
+```
+
+**説明:**
+- 標準DETRで4×4クロップ画像を学習
+- 実効バッチサイズ = 4 × 16 = 64クロップ
+
+---
+
 ### 3. グリッドサイズを変更（2×2グリッド）
 
 ```bash
@@ -172,6 +213,18 @@ python visualize_predictions.py \
   --split val \
   --num_samples 10 \
   --output_dir outputs/visualizations
+```
+
+元のDETR（分類あり）の可視化:
+
+```bash
+python visualize_predictions.py \
+  --checkpoint outputs/detr_kuzushiji_det_no_crop/checkpoint.pth \
+  --dataset_file kuzushiji_det \
+  --kuzushiji_path <path_to_dataset> \
+  --split val \
+  --num_samples 10 \
+  --output_dir outputs/visualizations_det
 ```
 
 ---

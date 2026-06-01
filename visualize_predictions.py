@@ -23,6 +23,8 @@ def parse_args():
                         help="Dataset start index")
     parser.add_argument("--output_dir", type=str, default="outputs/visualizations",
                         help="Directory to save rendered images")
+    parser.add_argument("--score_threshold", type=float, default=0.5,
+                        help="Score threshold for drawing predicted boxes")
 
     # Optional overrides if checkpoint args are missing or outdated.
     parser.add_argument("--dataset_file", type=str, default=None)
@@ -111,6 +113,9 @@ def ensure_checkpoint_args(train_args, cli_args):
     if train_args.dataset_file == "kuzushiji_text":
         train_args.use_text_queries = True
         train_args.bbox_only = True
+    elif train_args.dataset_file == "kuzushiji_det":
+        train_args.use_text_queries = False
+        train_args.bbox_only = False
 
     return train_args
 
@@ -130,20 +135,41 @@ def boxes_cxcywh_to_xyxy_abs(boxes, h, w):
     return xyxy
 
 
-def draw_boxes(image, gt_boxes_xyxy, pred_boxes_xyxy):
+def draw_boxes(image, gt_boxes_xyxy, pred_boxes_xyxy, gt_labels=None, pred_labels=None, pred_scores=None):
     draw = ImageDraw.Draw(image)
 
     for i, b in enumerate(gt_boxes_xyxy.tolist()):
         x1, y1, x2, y2 = b
         draw.rectangle([x1, y1, x2, y2], outline=(50, 220, 50), width=2)
-        draw.text((x1, max(0, y1 - 12)), f"gt:{i}", fill=(50, 220, 50))
+        label = f"gt:{i}"
+        if gt_labels is not None and i < len(gt_labels):
+            label = f"gt:{gt_labels[i]}"
+        draw.text((x1, max(0, y1 - 12)), label, fill=(50, 220, 50))
 
     for i, b in enumerate(pred_boxes_xyxy.tolist()):
         x1, y1, x2, y2 = b
         draw.rectangle([x1, y1, x2, y2], outline=(220, 50, 50), width=2)
-        draw.text((x1, y1 + 2), f"pred:{i}", fill=(220, 50, 50))
+        label = f"pred:{i}"
+        if pred_labels is not None and i < len(pred_labels):
+            label = f"pred:{pred_labels[i]}"
+        if pred_scores is not None and i < len(pred_scores):
+            label = f"{label}({pred_scores[i]:.2f})"
+        draw.text((x1, y1 + 2), label, fill=(220, 50, 50))
 
     return image
+
+
+def format_label_names(label_ids, label_to_char):
+    if label_to_char is None:
+        return [str(int(i)) for i in label_ids]
+    names = []
+    for idx in label_ids:
+        idx = int(idx)
+        if 0 <= idx < len(label_to_char):
+            names.append(label_to_char[idx])
+        else:
+            names.append(str(idx))
+    return names
 
 
 def main():
@@ -158,17 +184,21 @@ def main():
 
     train_args = ensure_checkpoint_args(checkpoint["args"], args)
 
-    if train_args.dataset_file == "kuzushiji_text" and getattr(train_args, "kuzushiji_path", None) is None:
+    if train_args.dataset_file in {"kuzushiji_text", "kuzushiji_det"} and getattr(train_args, "kuzushiji_path", None) is None:
         raise ValueError("kuzushiji_path is required. Pass --kuzushiji_path.")
 
     device = torch.device(train_args.device)
+
+    dataset = build_dataset(image_set=args.split, args=train_args)
+    if hasattr(dataset, "num_classes"):
+        train_args.num_classes = dataset.num_classes
 
     model, _, _ = build_model(train_args)
     model.load_state_dict(checkpoint["model"], strict=True)
     model.to(device)
     model.eval()
 
-    dataset = build_dataset(image_set=args.split, args=train_args)
+    label_to_char = getattr(dataset, "label_to_char", None)
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -190,13 +220,26 @@ def main():
                 outputs = model(sample)
 
             pred_boxes = outputs["pred_boxes"][0].detach().cpu()
+            pred_labels = None
+            pred_scores = None
+            if "pred_logits" in outputs:
+                probs = outputs["pred_logits"][0].softmax(-1)
+                scores, labels = probs[..., :-1].max(-1)
+                keep = scores >= args.score_threshold
+                pred_boxes = pred_boxes[keep].cpu()
+                pred_scores = scores[keep].cpu().tolist()
+                pred_labels = format_label_names(labels[keep].cpu().tolist(), label_to_char)
 
+            valid_n = None
             if "token_ids" in target:
                 valid_n = int(target["token_ids"].shape[0])
                 pred_boxes = pred_boxes[:valid_n]
 
             print('-'*30)
-            print(f"Sample {idx}: predicted: {pred_boxes.shape[0]} valid_n: {valid_n}")            
+            if valid_n is None:
+                print(f"Sample {idx}: predicted: {pred_boxes.shape[0]}")
+            else:
+                print(f"Sample {idx}: predicted: {pred_boxes.shape[0]} valid_n: {valid_n}")
             if pred_boxes.numel() > 0:
                 print("pred cxcywh mean:", pred_boxes.mean(dim=0).tolist())
                 print("pred cxcywh std :", pred_boxes.std(dim=0).tolist())
@@ -207,6 +250,10 @@ def main():
             else:
                 raise ValueError("target must include boxes_aligned or boxes")
 
+            gt_labels = None
+            if "labels" in target:
+                gt_labels = format_label_names(target["labels"].cpu().tolist(), label_to_char)
+
             h = int(target["size"][0].item())
             w = int(target["size"][1].item())
 
@@ -214,7 +261,14 @@ def main():
             pred_xyxy = boxes_cxcywh_to_xyxy_abs(pred_boxes, h, w)
 
             vis_image = tensor_to_pil(image_tensor)
-            vis_image = draw_boxes(vis_image, gt_xyxy, pred_xyxy)
+            vis_image = draw_boxes(
+                vis_image,
+                gt_xyxy,
+                pred_xyxy,
+                gt_labels=gt_labels,
+                pred_labels=pred_labels,
+                pred_scores=pred_scores,
+            )
 
             save_path = out_dir / f"sample_{idx:05d}.png"
             vis_image.save(save_path)

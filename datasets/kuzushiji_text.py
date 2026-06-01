@@ -144,6 +144,17 @@ def transform_bbox_to_crop_coords(x, y, w, h, crop_box, crop_w, crop_h):
     return cx_norm, cy_norm, w_norm, h_norm
 
 
+def clip_bbox_to_crop_xyxy(x, y, w, h, crop_box):
+    x1_crop, y1_crop, x2_crop, y2_crop = crop_box
+    x1 = max(x, x1_crop)
+    y1 = max(y, y1_crop)
+    x2 = min(x + w, x2_crop)
+    y2 = min(y + h, y2_crop)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return [x1 - x1_crop, y1 - y1_crop, x2 - x1_crop, y2 - y1_crop]
+
+
 class KuzushijiTextDataset(torch.utils.data.Dataset):
     def __init__(self, root, split="train", split_ratio=0.8, seed=42, max_samples=None,
                  vocab_size=65536, sort_tokens=False, resize_short=640, resize_max_size=1024,
@@ -398,6 +409,227 @@ class KuzushijiTextDataset(torch.utils.data.Dataset):
         return image_cropped, target
 
 
+class KuzushijiDetDataset(torch.utils.data.Dataset):
+    def __init__(self, root, split="train", split_ratio=0.8, seed=42, max_samples=None,
+                 sort_tokens=False, resize_short=640, resize_max_size=1024,
+                 use_crop_grid=True, grid_size=4):
+        self.root = Path(root)
+        if not self.root.exists():
+            raise ValueError(f"provided dataset path {self.root} does not exist")
+
+        self.sort_tokens = sort_tokens
+        self.use_crop_grid = use_crop_grid
+        self.grid_size = grid_size
+
+        samples = self._build_samples()
+        self.char_to_label = self._build_char_mapping(samples)
+        self.label_to_char = [
+            ch for ch, _ in sorted(self.char_to_label.items(), key=lambda kv: kv[1])
+        ]
+        self.num_classes = len(self.char_to_label)
+
+        g = torch.Generator().manual_seed(seed)
+        perm = torch.randperm(len(samples), generator=g).tolist()
+        split_index = int(len(samples) * split_ratio)
+        if split == "train":
+            ids = perm[:split_index]
+        elif split == "val":
+            ids = perm[split_index:]
+        else:
+            raise ValueError(f"unknown split {split}")
+
+        self.samples = [samples[i] for i in ids]
+        if max_samples is not None:
+            self.samples = self.samples[:max_samples]
+
+        self._transforms = make_kuzushiji_transforms(
+            split,
+            resize_short=resize_short,
+            max_size=resize_max_size,
+        )
+
+    def _codepoint_to_char(self, codepoint):
+        if isinstance(codepoint, str) and codepoint.startswith("U+"):
+            return chr(int(codepoint[2:], 16))
+        return str(codepoint)
+
+    def _build_image_index(self):
+        exts = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
+        image_index = {}
+        for doc_folder in os.listdir(self.root):
+            images_dir = self.root / doc_folder / "images"
+            if not images_dir.is_dir():
+                continue
+            for fname in os.listdir(images_dir):
+                ext = Path(fname).suffix.lower()
+                if ext not in exts:
+                    continue
+                key = Path(fname).stem
+                image_index[key] = str(images_dir / fname)
+        return image_index
+
+    def _build_samples(self):
+        image_index = self._build_image_index()
+        rows_by_image = {}
+
+        for doc_folder in os.listdir(self.root):
+            doc_path = self.root / doc_folder
+            if not doc_path.is_dir():
+                continue
+            for filename in os.listdir(doc_path):
+                if not filename.lower().endswith(".csv"):
+                    continue
+                csv_path = doc_path / filename
+                with open(csv_path, "r", encoding="utf-8", newline="") as f:
+                    reader = csv.reader(f)
+                    for row in reader:
+                        if not row or len(row) < 8:
+                            continue
+                        if not row[0].startswith("U+"):
+                            continue
+
+                        image_id = row[1]
+                        image_path = image_index.get(image_id)
+                        if image_path is None:
+                            continue
+
+                        try:
+                            x = int(row[2])
+                            y = int(row[3])
+                            w = int(row[6])
+                            h = int(row[7])
+                        except ValueError:
+                            continue
+
+                        ch = self._codepoint_to_char(row[0])
+                        rows_by_image.setdefault(image_id, {
+                            "image_path": image_path,
+                            "items": [],
+                        })
+                        rows_by_image[image_id]["items"].append({
+                            "char": ch,
+                            "x": x,
+                            "y": y,
+                            "w": w,
+                            "h": h,
+                        })
+
+        samples = []
+        for image_id, data in rows_by_image.items():
+            items = data["items"]
+            if self.sort_tokens:
+                items.sort(key=lambda r: (-r["x"], r["y"]))
+
+            chars = [it["char"] for it in items]
+            boxes_xywh = [[it["x"], it["y"], it["w"], it["h"]] for it in items]
+            if len(chars) == 0:
+                continue
+
+            samples.append({
+                "image_id": image_id,
+                "image_path": data["image_path"],
+                "chars": chars,
+                "boxes_xywh": boxes_xywh,
+            })
+        return samples
+
+    def _build_char_mapping(self, samples):
+        chars = sorted({ch for sample in samples for ch in sample["chars"]})
+        return {ch: idx for idx, ch in enumerate(chars)}
+
+    def __len__(self):
+        if self.use_crop_grid:
+            return len(self.samples) * (self.grid_size * self.grid_size)
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        if self.use_crop_grid:
+            sample_idx = idx // (self.grid_size * self.grid_size)
+            crop_idx = idx % (self.grid_size * self.grid_size)
+            return self._getitem_with_crop(sample_idx, crop_idx)
+        return self._getitem_no_crop(idx)
+
+    def _getitem_no_crop(self, idx):
+        sample = self.samples[idx]
+        image = Image.open(sample["image_path"]).convert("RGB")
+        width, height = image.size
+
+        labels = []
+        boxes = []
+        for ch, (x, y, w, h) in zip(sample["chars"], sample["boxes_xywh"]):
+            x1 = max(0.0, min(float(x), width - 1.0))
+            y1 = max(0.0, min(float(y), height - 1.0))
+            x2 = max(0.0, min(x1 + float(w), width))
+            y2 = max(0.0, min(y1 + float(h), height))
+            if x2 <= x1 or y2 <= y1:
+                continue
+            boxes.append([x1, y1, x2, y2])
+            labels.append(self.char_to_label[ch])
+
+        if len(boxes) == 0:
+            boxes_tensor = torch.zeros((0, 4), dtype=torch.float32)
+            labels_tensor = torch.zeros((0,), dtype=torch.long)
+        else:
+            boxes_tensor = torch.tensor(boxes, dtype=torch.float32)
+            labels_tensor = torch.tensor(labels, dtype=torch.long)
+
+        target = {
+            "image_id": torch.tensor([idx]),
+            "boxes": boxes_tensor,
+            "labels": labels_tensor,
+            "orig_size": torch.tensor([int(height), int(width)]),
+            "size": torch.tensor([int(height), int(width)]),
+        }
+
+        if self._transforms is not None:
+            image, target = self._transforms(image, target)
+
+        return image, target
+
+    def _getitem_with_crop(self, sample_idx, crop_idx):
+        sample = self.samples[sample_idx]
+        image = Image.open(sample["image_path"]).convert("RGB")
+        width, height = image.size
+
+        crops = compute_crop_grid(height, width, self.grid_size)
+        crop_box = crops[crop_idx]
+        x1_crop, y1_crop, x2_crop, y2_crop = crop_box
+        crop_w = x2_crop - x1_crop
+        crop_h = y2_crop - y1_crop
+
+        image_cropped = image.crop((x1_crop, y1_crop, x2_crop, y2_crop))
+
+        labels = []
+        boxes = []
+        for ch, (x, y, w, h) in zip(sample["chars"], sample["boxes_xywh"]):
+            clipped = clip_bbox_to_crop_xyxy(x, y, w, h, crop_box)
+            if clipped is None:
+                continue
+            boxes.append(clipped)
+            labels.append(self.char_to_label[ch])
+
+        unique_image_id = sample_idx * (self.grid_size * self.grid_size) + crop_idx
+        if len(boxes) == 0:
+            boxes_tensor = torch.zeros((0, 4), dtype=torch.float32)
+            labels_tensor = torch.zeros((0,), dtype=torch.long)
+        else:
+            boxes_tensor = torch.tensor(boxes, dtype=torch.float32)
+            labels_tensor = torch.tensor(labels, dtype=torch.long)
+
+        target = {
+            "image_id": torch.tensor([unique_image_id]),
+            "boxes": boxes_tensor,
+            "labels": labels_tensor,
+            "orig_size": torch.tensor([int(crop_h), int(crop_w)]),
+            "size": torch.tensor([int(crop_h), int(crop_w)]),
+        }
+
+        if self._transforms is not None:
+            image_cropped, target = self._transforms(image_cropped, target)
+
+        return image_cropped, target
+
+
 def build(image_set, args):
     root = getattr(args, "kuzushiji_path", None)
     if root is None:
@@ -410,6 +642,25 @@ def build(image_set, args):
         seed=getattr(args, "seed", 42),
         max_samples=getattr(args, "kuzushiji_max_samples", None),
         vocab_size=getattr(args, "text_vocab_size", 65536),
+        sort_tokens=getattr(args, "kuzushiji_sort_tokens", False),
+        resize_short=getattr(args, "kuzushiji_resize_short", 640),
+        resize_max_size=getattr(args, "kuzushiji_resize_max_size", 1024),
+        use_crop_grid=getattr(args, "kuzushiji_use_crop_grid", True),
+        grid_size=getattr(args, "kuzushiji_grid_size", 4),
+    )
+
+
+def build_kuzushiji_det(image_set, args):
+    root = getattr(args, "kuzushiji_path", None)
+    if root is None:
+        raise ValueError("--kuzushiji_path is required for dataset_file=kuzushiji_det")
+
+    return KuzushijiDetDataset(
+        root=root,
+        split=image_set,
+        split_ratio=getattr(args, "kuzushiji_split_ratio", 0.8),
+        seed=getattr(args, "seed", 42),
+        max_samples=getattr(args, "kuzushiji_max_samples", None),
         sort_tokens=getattr(args, "kuzushiji_sort_tokens", False),
         resize_short=getattr(args, "kuzushiji_resize_short", 640),
         resize_max_size=getattr(args, "kuzushiji_resize_max_size", 1024),

@@ -154,6 +154,9 @@ def main(args):
     if args.dataset_file == "kuzushiji_text":
         args.use_text_queries = True
         args.bbox_only = True
+    elif args.dataset_file == "kuzushiji_det":
+        args.use_text_queries = False
+        args.bbox_only = False
 
     if args.frozen_weights is not None:
         assert args.masks, "Frozen training is meant for segmentation only"
@@ -166,6 +169,12 @@ def main(args):
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
+
+    dataset_train = build_dataset(image_set='train', args=args)
+    dataset_val = build_dataset(image_set='val', args=args)
+
+    if args.dataset_file == "kuzushiji_det" and hasattr(dataset_train, "num_classes"):
+        args.num_classes = dataset_train.num_classes
 
     model, criterion, postprocessors = build_model(args)
     model.to(device)
@@ -187,9 +196,6 @@ def main(args):
     optimizer = torch.optim.AdamW(param_dicts, lr=args.lr,
                                   weight_decay=args.weight_decay)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop)
-
-    dataset_train = build_dataset(image_set='train', args=args)
-    dataset_val = build_dataset(image_set='val', args=args)
 
     if args.distributed:
         sampler_train = DistributedSampler(dataset_train)
